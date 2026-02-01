@@ -6,6 +6,10 @@ import glob
 import random
 import tensorflow as tf
 import numpy as np
+try:
+    from ultralytics import YOLO
+except ImportError:
+    YOLO = None
 
 # Page config
 st.set_page_config(page_title="CRCCD Dataset Explorer & Prediction", page_icon="🔬", layout="wide")
@@ -57,7 +61,7 @@ if not stats:
 df_stats = pd.DataFrame(list(stats.items()), columns=["Class", "Count"])
 
 # --- Tabs ---
-tab1, tab2, tab3 = st.tabs(["📊 Overview", "🖼️ Gallery", "🤖 Prediction Analysis"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Overview", "🖼️ Gallery", "🤖 Prediction Analysis", "📈 Advanced Metrics"])
 
 with tab1:
     st.subheader(f"{dataset_split} Dataset Distribution")
@@ -98,21 +102,51 @@ with tab2:
 with tab3:
     st.subheader("AI Diagnosis Assistant")
     
-    model_path = os.path.join(BASE_DIR, "model.h5")
+    # Model Selection
+    model_choice = st.radio("Select AI Model", ["YOLOv8 (Recommended)", "MobileNetV2 (Legacy)"], horizontal=True)
+    
+    model_path_mobilenet = os.path.join(BASE_DIR, "model.h5")
     class_names_path = os.path.join(BASE_DIR, "class_names.txt")
     
-    if os.path.exists(model_path) and os.path.exists(class_names_path):
-        @st.cache_resource
-        def load_model_and_classes():
-            model = tf.keras.models.load_model(model_path)
-            with open(class_names_path, "r") as f:
-                classes = f.read().splitlines()
-            return model, classes
+    # YOLO Model Path
+    # It might be in runs/classify/yolo_results/weights/best.pt
+    model_path_yolo = os.path.join(BASE_DIR, "yolo_results", "weights", "best.pt")
 
-        with st.spinner("Loading AI Model..."):
-            model, class_names = load_model_and_classes()
+    model_ready = False
+    
+    if model_choice == "MobileNetV2 (Legacy)":
+        if os.path.exists(model_path_mobilenet) and os.path.exists(class_names_path):
+            @st.cache_resource
+            def load_mobilenet():
+                model = tf.keras.models.load_model(model_path_mobilenet)
+                with open(class_names_path, "r") as f:
+                    classes = f.read().splitlines()
+                return model, classes
             
-        st.success("Model loaded successfully!")
+            with st.spinner("Loading MobileNetV2..."):
+                model, class_names = load_mobilenet()
+                model_ready = True
+        else:
+            st.warning("MobileNetV2 model not found.")
+
+    else: # YOLO
+        if YOLO is None:
+            st.error("Ultralytics library not installed.")
+        elif os.path.exists(model_path_yolo):
+            @st.cache_resource
+            def load_yolo():
+                return YOLO(model_path_yolo)
+            
+            with st.spinner("Loading YOLOv8..."):
+                model = load_yolo()
+                # Class names are inside the model object
+                class_names = list(model.names.values())
+                model_ready = True
+        else:
+            st.warning("YOLOv8 model not found. Please run training.")
+
+    if model_ready:
+        st.success(f"{model_choice} loaded successfully!")
         
         # Input selection
         input_method = st.radio("Choose Input Method", ["Upload Image", "Select Random Test Image"])
@@ -142,29 +176,83 @@ with tab3:
             st.image(image_to_predict, caption="Input Image", width=300)
             
             if st.button("Analyze Image"):
-                # Preprocess
-                img = image_to_predict.resize((224, 224))
-                img_array = tf.keras.preprocessing.image.img_to_array(img)
-                img_array = np.expand_dims(img_array, axis=0)
-                img_array /= 255.0  # Rescale match training
+                predicted_label = "Unknown"
+                confidence = 0.0
+                chart_data = None
                 
-                prediction = model.predict(img_array)
-                predicted_class_idx = np.argmax(prediction[0])
-                confidence = np.max(prediction[0])
-                predicted_label = class_names[predicted_class_idx]
+                if model_choice == "MobileNetV2 (Legacy)":
+                    try:
+                        # Preprocess
+                        img = image_to_predict.resize((224, 224))
+                        img_array = tf.keras.preprocessing.image.img_to_array(img)
+                        img_array = np.expand_dims(img_array, axis=0)
+                        img_array /= 255.0 
+                        
+                        prediction = model.predict(img_array)
+                        predicted_class_idx = np.argmax(prediction[0])
+                        confidence = np.max(prediction[0])
+                        predicted_label = class_names[predicted_class_idx]
+                        
+                        chart_data = pd.DataFrame({
+                            "Class": class_names,
+                            "Probability": prediction[0]
+                        })
+                    except Exception as e:
+                        st.error(f"Error predicting with MobileNet: {e}")
                 
+                else: # YOLO
+                    try:
+                        # Inference
+                        # YOLO accepts PIL image directly
+                        results = model(image_to_predict)
+                        
+                        # Extract results
+                        # results is a list
+                        res = results[0]
+                        probs = res.probs.data.cpu().numpy() # Probability array
+                        top1_idx = np.argmax(probs)
+                        
+                        predicted_label = class_names[top1_idx]
+                        confidence = probs[top1_idx]
+                        
+                        chart_data = pd.DataFrame({
+                            "Class": class_names,
+                            "Probability": probs
+                        })
+                    except Exception as e:
+                        st.error(f"Error predicting with YOLO: {e}")
+
                 st.markdown(f"### Prediction: **{predicted_label}**")
                 st.markdown(f"**Confidence:** {confidence*100:.2f}%")
                 
-                # Bar chart of probabilities
-                chart_data = pd.DataFrame({
-                    "Class": class_names,
-                    "Probability": prediction[0]
-                })
-                st.bar_chart(chart_data.set_index("Class"))
-                
+                if chart_data is not None:
+                    st.bar_chart(chart_data.set_index("Class"))
+
+with tab4:
+    st.subheader("📈 Performance Metrics")
+    st.markdown("Metrics generated during YOLOv8 Training.")
+    
+    # YOLO automatically saves plots in runs/classify/yolo_results
+    yolo_results_dir = os.path.join(BASE_DIR, "yolo_results")
+    
+    if os.path.exists(yolo_results_dir):
+        # Confusion Matrix
+        cm_path = os.path.join(yolo_results_dir, "confusion_matrix.png")
+        if os.path.exists(cm_path):
+            st.image(cm_path, caption="Confusion Matrix", use_container_width=True)
+            
+        # Results (Loss/Accuracy curves)
+        res_path = os.path.join(yolo_results_dir, "results.png")
+        if os.path.exists(res_path):
+            st.image(res_path, caption="Training Results (Loss & Accuracy)", use_container_width=True)
+            
+        # Normalized Confusion Matrix
+        cm_norm_path = os.path.join(yolo_results_dir, "confusion_matrix_normalized.png")
+        if os.path.exists(cm_norm_path):
+            st.image(cm_norm_path, caption="Normalized Confusion Matrix", use_container_width=True)
+            
     else:
-        st.warning("Model (`model.h5`) not found. Please run the training script or restart the app application via `run_app.bat`.")
+        st.info("No YOLO training results found yet. Train the model to see metrics here.")
 
 st.markdown("---")
 st.caption(f"Reading from: {active_dir}")
